@@ -495,6 +495,7 @@ class MLA(nn.Module):
 
         # 得到Q
         if self.q_lora_rank == 0:
+            # 查询投影：将输入映射到16个注意力头的查询向量（会被分到多张GPU上）
             self.wq = ColumnParallelLinear(
                 # 2048 -> 16 * 192 = 3072
                 self.dim,
@@ -510,7 +511,9 @@ class MLA(nn.Module):
                 self.q_lora_rank,
                 self.n_heads * self.qk_head_dim,
             )
+
         # 2048 -> 512 + 64 = 576
+        # 生成低秩KV表示 + 位置感知K,512维用于后续KV生成，64维用于旋转位置编码
         self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
         self.kv_norm = RMSNorm(self.kv_lora_rank)
         # 512 -> 16 * (128 + 128) = 2304
@@ -600,15 +603,22 @@ class MLA(nn.Module):
         # 只有qk_rope_head_dim维的特征被加入了位置信息，实行分工，提高效率，一部分记录位置信息即可，不需要旋转所有维度的特征
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
 
+        # 生成低秩KV表示 + 位置感知K
         kv = self.wkv_a(x)
+        # 拆分出 低秩KV 和 位置感知K
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        # 为使用位置K添加旋转位置信息
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+
         if attn_impl == "naive":
             q = torch.cat([q_nope, q_pe], dim=-1)
+
+            # 生成所有头的无位置K和V，从512维低秩空间映射到16 * 256维KV表示
             kv = self.wkv_b(self.kv_norm(kv))
             kv = kv.view(
                 bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )
+            # 拆分出无位置K和V
             k_nope, v = torch.split(
                 kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
             )
@@ -635,7 +645,7 @@ class MLA(nn.Module):
                 torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos])
                 + torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])
             ) * self.softmax_scale
-            
+
         if mask is not None:
             scores += mask.unsqueeze(1)
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
