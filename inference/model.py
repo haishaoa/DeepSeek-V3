@@ -228,7 +228,8 @@ class Linear(nn.Module):
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
             self.weight.scale = self.scale = nn.Parameter(
-                torch.empty(scale_out_features, scale_in_features, dtype=torch.float32)
+                torch.empty(scale_out_features, scale_in_features,
+                            dtype=torch.float32)
             )
         else:
             self.register_parameter("scale", None)
@@ -419,11 +420,13 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
         """
         if min == max:
             max += 0.001
-        linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+        linear_func = (torch.arange(
+            dim, dtype=torch.float32) - min) / (max - min)
         ramp_func = torch.clamp(linear_func, 0, 1)
         return ramp_func
 
-    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    freqs = 1.0 / \
+        (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     if seqlen > args.original_seq_len:
         low, high = find_correction_range(
             beta_fast, beta_slow, dim, base, args.original_seq_len
@@ -514,15 +517,18 @@ class MLA(nn.Module):
 
         # 2048 -> 512 + 64 = 576
         # 生成低秩KV表示 + 位置感知K,512维用于后续KV生成，64维用于旋转位置编码
-        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
+        self.wkv_a = Linear(self.dim, self.kv_lora_rank +
+                            self.qk_rope_head_dim)
         self.kv_norm = RMSNorm(self.kv_lora_rank)
         # 512 -> 16 * (128 + 128) = 2304
+        # 根据中间低秩映射到每个注意力头的无位置K和V
         self.wkv_b = ColumnParallelLinear(
-            self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim)
+            self.kv_lora_rank, self.n_heads *
+            (self.qk_nope_head_dim + self.v_head_dim)
         )
         # 16 * 128 = 2048 -> 2048
         self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
-        # 192的倒数的开平方根
+        # 等价于：1 / sqrt(qk_head_dim)，缩放注意力分数，防止梯度消失或爆炸
         self.softmax_scale = self.qk_head_dim**-0.5
         if args.max_seq_len > args.original_seq_len:
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
@@ -552,7 +558,8 @@ class MLA(nn.Module):
         else:
             self.register_buffer(
                 "kv_cache",
-                torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank),
+                torch.zeros(args.max_batch_size,
+                            args.max_seq_len, self.kv_lora_rank),
                 persistent=False,
             )
             self.register_buffer(
@@ -606,7 +613,8 @@ class MLA(nn.Module):
         # 生成低秩KV表示 + 位置感知K
         kv = self.wkv_a(x)
         # 拆分出 低秩KV 和 位置感知K
-        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv, k_pe = torch.split(
+            kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         # 为使用位置K添加旋转位置信息
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
 
@@ -622,11 +630,15 @@ class MLA(nn.Module):
             k_nope, v = torch.split(
                 kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
             )
-            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+            k = torch.cat(
+                [k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+
             self.k_cache[:bsz, start_pos:end_pos] = k
             self.v_cache[:bsz, start_pos:end_pos] = v
+            # 计算Q * K 的分数
             scores = (
-                torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos])
+                torch.einsum("bshd,bthd->bsht", q,
+                             self.k_cache[:bsz, :end_pos])
                 * self.softmax_scale
             )
         else:
@@ -642,18 +654,22 @@ class MLA(nn.Module):
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
             scores = (
-                torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos])
-                + torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])
+                torch.einsum("bshc,btc->bsht", q_nope,
+                             self.kv_cache[:bsz, :end_pos])
+                + torch.einsum("bshr,btr->bsht", q_pe,
+                               self.pe_cache[:bsz, :end_pos])
             ) * self.softmax_scale
 
         if mask is not None:
             scores += mask.unsqueeze(1)
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
         if attn_impl == "naive":
-            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
+            x = torch.einsum("bsht,bthd->bshd", scores,
+                             self.v_cache[:bsz, :end_pos])
         else:
-            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
-            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim :])
+            x = torch.einsum("bsht,btc->bshc", scores,
+                             self.kv_cache[:bsz, :end_pos])
+            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
         x = self.wo(x.flatten(2))
         return x
 
@@ -723,9 +739,11 @@ class Gate(nn.Module):
         self.topk_groups = args.n_limited_groups
         self.score_func = args.score_func
         self.route_scale = args.route_scale
-        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
+        self.weight = nn.Parameter(
+            torch.empty(args.n_routed_experts, args.dim))
         self.bias = (
-            nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
+            nn.Parameter(torch.empty(
+                args.n_routed_experts, dtype=torch.float32))
             if self.dim == 7168
             else None
         )
@@ -758,7 +776,8 @@ class Gate(nn.Module):
             mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(
                 1, indices, False
             )
-            scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
+            scores = scores.masked_fill_(
+                mask.unsqueeze(-1), float("-inf")).flatten(1)
         indices = torch.topk(scores, self.topk, dim=-1)[1]
         weights = original_scores.gather(1, indices)
         if self.score_func == "sigmoid":
@@ -845,7 +864,8 @@ class MoE(nn.Module):
                 for i in range(self.n_routed_experts)
             ]
         )
-        self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
+        self.shared_experts = MLP(
+            args.dim, args.n_shared_experts * args.moe_inter_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -974,7 +994,8 @@ class Transformer(nn.Module):
         self.head = ColumnParallelLinear(
             args.dim, args.vocab_size, dtype=torch.get_default_dtype()
         )
-        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+        self.register_buffer(
+            "freqs_cis", precompute_freqs_cis(args), persistent=False)
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
@@ -993,7 +1014,7 @@ class Transformer(nn.Module):
         # 向量化
         h = self.embed(tokens)
         # 查看缓存
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        freqs_cis = self.freqs_cis[start_pos: start_pos + seqlen]
         mask = None
         if seqlen > 1:
             # 生成一个矩阵，上三角为-inf
